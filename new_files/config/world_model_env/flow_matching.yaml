@@ -1,0 +1,6 @@
+_target_: envs.WorldModelEnvConfig
+horizon: 15
+num_batches_to_preload: 256
+diffusion_sampler:
+  _target_: models.diffusion.FlowMatchingSamplerConfig
+  num_steps: 5  # 拡散モデル版(3ステップ)よりやや多め。少ステップでも良い品質が出るのがFlow Matchingの利点

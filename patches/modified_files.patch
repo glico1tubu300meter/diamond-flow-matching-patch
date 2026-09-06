@@ -1,0 +1,187 @@
+diff --git a/config/trainer.yaml b/config/trainer.yaml
+index 1f9fe30..d9a08c8 100644
+--- a/config/trainer.yaml
++++ b/config/trainer.yaml
+@@ -2,6 +2,7 @@ defaults:
+   - _self_
+   - env: atari
+   - agent: default
++  - world_model_env: diffusion
+ 
+ hydra:
+   job:
+@@ -63,22 +64,6 @@ evaluation:
+   should: True
+   every: 10
+ 
+-world_model_env:
+-  _target_: envs.WorldModelEnvConfig
+-  horizon: 15
+-  num_batches_to_preload: 256
+-  diffusion_sampler:
+-    _target_: models.diffusion.DiffusionSamplerConfig
+-    num_steps_denoising: 3
+-    sigma_min: 2e-3
+-    sigma_max: 5.0
+-    rho: 7
+-    order: 1  # 1: Euler, 2: Heun
+-    s_churn: 0.0  # Amount of stochasticity
+-    s_tmin: 0.0
+-    s_tmax: ${eval:'float("inf")'}
+-    s_noise: 1.0
+-
+ denoiser:
+   training:
+     num_autoregressive_steps: 1
+diff --git a/src/agent.py b/src/agent.py
+index e9e0944..863d4d8 100644
+--- a/src/agent.py
++++ b/src/agent.py
+@@ -7,16 +7,17 @@ import torch.nn as nn
+ 
+ from envs import TorchEnv, WorldModelEnv
+ from models.actor_critic import ActorCritic, ActorCriticConfig, ActorCriticLossConfig
+-from models.diffusion import Denoiser, DenoiserConfig, SigmaDistributionConfig
++from models.diffusion import Denoiser, DenoiserConfig, FlowMatching, FlowMatchingConfig, SigmaDistributionConfig
++from models.flow_matching_actor_critic import FlowMatchingActorCritic, FlowMatchingActorCriticConfig
+ from models.rew_end_model import RewEndModel, RewEndModelConfig
+ from utils import extract_state_dict
+ 
+ 
+ @dataclass
+ class AgentConfig:
+-    denoiser: DenoiserConfig
++    denoiser: Union[DenoiserConfig, FlowMatchingConfig]
+     rew_end_model: RewEndModelConfig
+-    actor_critic: ActorCriticConfig
++    actor_critic: Union[ActorCriticConfig, FlowMatchingActorCriticConfig]
+     num_actions: int
+ 
+     def __post_init__(self) -> None:
+@@ -28,9 +29,12 @@ class AgentConfig:
+ class Agent(nn.Module):
+     def __init__(self, cfg: AgentConfig) -> None:
+         super().__init__()
+-        self.denoiser = Denoiser(cfg.denoiser)
++        # cfg.denoiserの型(Denoiser用/FlowMatching用)に応じてモデルを切り替える
++        model_cls = FlowMatching if isinstance(cfg.denoiser, FlowMatchingConfig) else Denoiser
++        self.denoiser = model_cls(cfg.denoiser)
+         self.rew_end_model = RewEndModel(cfg.rew_end_model)
+-        self.actor_critic = ActorCritic(cfg.actor_critic)
++        ac_cls = FlowMatchingActorCritic if isinstance(cfg.actor_critic, FlowMatchingActorCriticConfig) else ActorCritic
++        self.actor_critic = ac_cls(cfg.actor_critic)
+ 
+     @property
+     def device(self):
+diff --git a/src/coroutines/collector.py b/src/coroutines/collector.py
+index 132b5ba..a2b607a 100644
+--- a/src/coroutines/collector.py
++++ b/src/coroutines/collector.py
+@@ -10,6 +10,7 @@ from . import coroutine
+ from data import Episode, Dataset
+ from envs import TorchEnv
+ from .env_loop import make_env_loop
++from .flow_matching_env_loop import make_flow_matching_env_loop
+ from utils import Logs
+ 
+ 
+@@ -42,7 +43,9 @@ def make_collector(
+ 
+     def reset():
+         nonlocal env_loop, episode_ids, dead
+-        env_loop = make_env_loop(env, model, epsilon)
++        # FlowMatchingActorCriticはpredict_act_valueの戻り値の形が違うため専用のenv_loopを使う
++        loop_factory = make_flow_matching_env_loop if hasattr(model, "sample_action_vector") else make_env_loop
++        env_loop = loop_factory(env, model, epsilon)
+         episode_ids = defaultdict(lambda: None)
+         dead = [None] * num_envs
+ 
+diff --git a/src/data/episode.py b/src/data/episode.py
+index 3e2f0af..e955c98 100644
+--- a/src/data/episode.py
++++ b/src/data/episode.py
+@@ -47,7 +47,7 @@ class Episode:
+         path.parent.mkdir(parents=True, exist_ok=True)
+         d = {k: v.add(1).div(2).mul(255).byte() if k == "obs" else v for k, v in self.__dict__.items()}
+         torch.save(d, path.with_suffix(".tmp"))
+-        path.with_suffix(".tmp").rename(path)
++        path.with_suffix(".tmp").replace(path)  # Path.rename()はWindowsで上書き不可のためreplace()を使う
+ 
+ 
+ def merge_info(info_a, info_b):
+diff --git a/src/envs/world_model_env.py b/src/envs/world_model_env.py
+index a45618c..e863d43 100644
+--- a/src/envs/world_model_env.py
++++ b/src/envs/world_model_env.py
+@@ -1,5 +1,5 @@
+ from dataclasses import dataclass
+-from typing import Any, Dict, Generator, List, Tuple
++from typing import Any, Dict, Generator, List, Tuple, Union
+ 
+ import torch
+ from torch import Tensor
+@@ -7,7 +7,14 @@ from torch.distributions.categorical import Categorical
+ from torch.utils.data import DataLoader
+ 
+ from coroutines import coroutine
+-from models.diffusion import Denoiser, DiffusionSampler, DiffusionSamplerConfig
++from models.diffusion import (
++    Denoiser,
++    DiffusionSampler,
++    DiffusionSamplerConfig,
++    FlowMatching,
++    FlowMatchingSampler,
++    FlowMatchingSamplerConfig,
++)
+ from models.rew_end_model import RewEndModel
+ 
+ ResetOutput = Tuple[torch.FloatTensor, Dict[str, Any]]
+@@ -19,19 +26,21 @@ InitialCondition = Tuple[Tensor, Tensor, Tuple[Tensor, Tensor]]
+ class WorldModelEnvConfig:
+     horizon: int
+     num_batches_to_preload: int
+-    diffusion_sampler: DiffusionSamplerConfig
++    diffusion_sampler: Union[DiffusionSamplerConfig, FlowMatchingSamplerConfig]
+ 
+ 
+ class WorldModelEnv:
+     def __init__(
+         self,
+-        denoiser: Denoiser,
++        denoiser: Union[Denoiser, FlowMatching],
+         rew_end_model: RewEndModel,
+         data_loader: DataLoader,
+         cfg: WorldModelEnvConfig,
+         return_denoising_trajectory: bool = False,
+     ) -> None:
+-        self.sampler = DiffusionSampler(denoiser, cfg.diffusion_sampler)
++        # denoiser/samplerの設定の型に応じて、拡散モデル用/フローマッチング用を切り替える
++        sampler_cls = FlowMatchingSampler if isinstance(cfg.diffusion_sampler, FlowMatchingSamplerConfig) else DiffusionSampler
++        self.sampler = sampler_cls(denoiser, cfg.diffusion_sampler)
+         self.rew_end_model = rew_end_model
+         self.horizon = cfg.horizon
+         self.return_denoising_trajectory = return_denoising_trajectory
+diff --git a/src/models/diffusion/__init__.py b/src/models/diffusion/__init__.py
+index 4fc4f9a..1c42480 100644
+--- a/src/models/diffusion/__init__.py
++++ b/src/models/diffusion/__init__.py
+@@ -1,3 +1,5 @@
+ from .denoiser import Denoiser, DenoiserConfig, SigmaDistributionConfig
+ from .inner_model import InnerModelConfig
+ from .diffusion_sampler import DiffusionSampler, DiffusionSamplerConfig
++from .flow_matching import FlowMatching, FlowMatchingConfig
++from .flow_matching_sampler import FlowMatchingSampler, FlowMatchingSamplerConfig
+diff --git a/src/trainer.py b/src/trainer.py
+index b665df0..01b9d9f 100644
+--- a/src/trainer.py
++++ b/src/trainer.py
+@@ -383,6 +383,9 @@ class Trainer(StateDictMixin):
+ 
+             to_log.append(metrics)
+ 
++            if i % max(1, num_steps // 20) == 0:
++                print(f"[{name}] step {i}/{num_steps} loss={loss.item():.5f}")
++
+         process_confusion_matrices_if_any_and_compute_classification_metrics(to_log)
+         to_log = [{f"{name}/train/{k}": v for k, v in d.items()} for d in to_log]
+         return to_log
