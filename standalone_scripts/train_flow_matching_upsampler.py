@@ -18,7 +18,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-REPO_SRC = r"I:\マイドライブ\Claude2\output\2609\06-021-diamond-wm\repo\src"
+REPO_SRC = r"/path/to/diamond/src"
 sys.path.insert(0, REPO_SRC)
 
 from models.diffusion.flow_matching import FlowMatching, FlowMatchingConfig  # noqa: E402
@@ -27,7 +27,7 @@ from envs import make_atari_env  # noqa: E402
 
 HIGH_RES = 128
 LOW_RES = 64
-OUT_DIR = r"I:\マイドライブ\Claude2\output\2609\06-021-diamond-wm\repo\outputs\upsampler_demo"
+OUT_DIR = r"/path/to/diamond/outputs/upsampler_demo"
 
 
 def collect_high_res_frames(n_frames: int, device: torch.device) -> torch.Tensor:

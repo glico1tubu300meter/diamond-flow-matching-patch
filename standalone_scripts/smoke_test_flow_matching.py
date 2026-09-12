@@ -11,7 +11,7 @@ import sys
 
 import torch
 
-REPO_SRC = r"I:\マイドライブ\Claude2\output\2609\06-021-diamond-wm\repo\src"
+REPO_SRC = r"/path/to/diamond/src"
 sys.path.insert(0, REPO_SRC)
 
 from data import Batch  # noqa: E402

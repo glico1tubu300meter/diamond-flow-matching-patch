@@ -17,7 +17,7 @@ from hydra import compose, initialize_config_dir
 from hydra.utils import instantiate
 from omegaconf import OmegaConf
 
-REPO_SRC = r"I:\マイドライブ\Claude2\output\2609\06-021-diamond-wm\repo\src"
+REPO_SRC = r"/path/to/diamond/src"
 sys.path.insert(0, REPO_SRC)
 
 OmegaConf.register_new_resolver("eval", eval)
